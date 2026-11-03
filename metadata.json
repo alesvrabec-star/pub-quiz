@@ -1,0 +1,6 @@
+{
+  "name": "Hospodský kvíz",
+  "description": "Pravý český hospodský kvíz s módem pro Kvízmistra, interaktivní týmovou hrou u stolu a bohatou zásobou vědomostních otázek.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
