@@ -278,16 +278,21 @@ function broadcastRoomState(room: RoomData) {
       fastestCorrectTeam: room.status === 'REVEAL' || room.status === 'FINAL_RESULTS' ? room.fastestCorrectTeam : null,
       waitingForTeamsCount,
       allAnswered,
+      myTeamId: Array.from(room.teams.values()).find((t) => t.ws === room.hostWs)?.id || null,
     },
   });
 
   if (room.hostWs && room.hostWs.readyState === WebSocket.OPEN) {
-    room.hostWs.send(payloadForHost);
+    try {
+      room.hostWs.send(payloadForHost);
+    } catch (e) {
+      console.warn('Chyba odeslání pro hostWs:', e);
+    }
   }
 
-  // Odeslání každému týmu zvlášť, aby viděl svou vlastní vybranou možnost i během QUESTION
+  // Odeslání každému týmu zvlášť (pokud není shodný s hostWs, aby nedostal zprávu dvakrát)
   room.teams.forEach((team) => {
-    if (team.ws && team.ws.readyState === WebSocket.OPEN) {
+    if (team.ws && team.ws.readyState === WebSocket.OPEN && team.ws !== room.hostWs) {
       const teamTeamsArray = teamsArray.map((t) => ({
         ...t,
         selectedOption: t.id === team.id ? team.selectedOption : t.selectedOption,
@@ -312,7 +317,11 @@ function broadcastRoomState(room: RoomData) {
         },
       });
 
-      team.ws.send(payloadForTeam);
+      try {
+        team.ws.send(payloadForTeam);
+      } catch (e) {
+        console.warn(`Chyba odeslání pro tým ${team.name}:`, e);
+      }
     }
   });
 }
@@ -465,6 +474,15 @@ async function startServer() {
     }
   });
 
+  // Pravidelný keepalive ping každých 20 sekund pro stabilitu mobilních a proxy spojení
+  setInterval(() => {
+    wss.clients.forEach((client) => {
+      if (client.readyState === WebSocket.OPEN) {
+        client.ping();
+      }
+    });
+  }, 20000);
+
   wss.on('connection', (ws) => {
     let attachedRoomCode: string | null = null;
     let attachedTeamId: string | null = null;
@@ -534,6 +552,37 @@ async function startServer() {
             room.hostWs = ws;
             attachedRoomCode = code;
             isHost = true;
+            const hostTeam = Array.from(room.teams.values()).find((t) => t.tableNumber === 1 || t.members.includes('Kvízmistr'));
+            if (hostTeam) {
+              hostTeam.ws = ws;
+              attachedTeamId = hostTeam.id;
+            }
+            ws.send(JSON.stringify({ type: 'ROOM_CREATED', code, hostTeamId: hostTeam?.id }));
+            broadcastRoomState(room);
+            break;
+          }
+
+          case 'RECONNECT': {
+            const code = (msg.code || '').toUpperCase();
+            const room = rooms.get(code);
+            if (!room) return;
+            attachedRoomCode = code;
+            if (msg.role === 'HOST_VIEW') {
+              room.hostWs = ws;
+              isHost = true;
+              const hostTeam = (msg.myTeamId && room.teams.get(msg.myTeamId)) ||
+                Array.from(room.teams.values()).find((t) => t.tableNumber === 1 || t.members.includes('Kvízmistr'));
+              if (hostTeam) {
+                hostTeam.ws = ws;
+                attachedTeamId = hostTeam.id;
+              }
+            } else if (msg.myTeamId) {
+              const team = room.teams.get(msg.myTeamId);
+              if (team) {
+                team.ws = ws;
+                attachedTeamId = team.id;
+              }
+            }
             broadcastRoomState(room);
             break;
           }
