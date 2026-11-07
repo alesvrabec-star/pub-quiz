@@ -239,7 +239,7 @@ function generateRoomCode(): string {
   return `${prefix}-${num}`;
 }
 
-function broadcastRoomState(room: RoomData) {
+function getRoomState(room: RoomData, forTeamId?: string | null) {
   const questionsList = room.rounds[room.currentRoundIndex]?.questions || [];
   const currentQuestion = questionsList[room.currentQuestionIndex] || null;
   const totalQuestions = room.rounds.reduce((acc, r) => acc + (r.questions?.length || 0), 0);
@@ -251,8 +251,8 @@ function broadcastRoomState(room: RoomData) {
     tableNumber: t.tableNumber,
     score: t.score,
     hasAnswered: t.hasAnswered,
-    // V průběhu otázky nesdílíme volbu s ostatními týmy, odhalíme až v REVEAL nebo pro vlastní tým
-    selectedOption: room.status === 'REVEAL' || room.status === 'FINAL_RESULTS' ? t.selectedOption : null,
+    // V průběhu otázky nesdílíme cizí volbu, odhalíme až v REVEAL nebo pro vlastní tým
+    selectedOption: room.status === 'REVEAL' || room.status === 'FINAL_RESULTS' || t.id === forTeamId ? t.selectedOption : null,
     responseTimeMs: room.status === 'REVEAL' || room.status === 'FINAL_RESULTS' ? t.responseTimeMs : null,
     earnedBonusPoint: room.status === 'REVEAL' || room.status === 'FINAL_RESULTS' ? t.earnedBonusPoint : false,
     pointsEarnedThisQuestion: room.status === 'REVEAL' || room.status === 'FINAL_RESULTS' ? t.pointsEarnedThisQuestion : 0,
@@ -263,23 +263,29 @@ function broadcastRoomState(room: RoomData) {
   const waitingForTeamsCount = Array.from(room.teams.values()).filter((t) => !t.hasAnswered || t.selectedOption === null).length;
   const allAnswered = room.teams.size > 0 && waitingForTeamsCount === 0;
 
+  return {
+    code: room.code,
+    status: room.status,
+    teams: teamsArray,
+    currentRoundIndex: room.currentRoundIndex,
+    currentQuestionIndex: room.currentQuestionIndex,
+    totalQuestions,
+    currentQuestion,
+    timerSeconds: room.timerSeconds,
+    startCountdown: room.startCountdown,
+    fastestCorrectTeam: room.status === 'REVEAL' || room.status === 'FINAL_RESULTS' ? room.fastestCorrectTeam : null,
+    waitingForTeamsCount,
+    allAnswered,
+    myTeamId: forTeamId || null,
+  };
+}
+
+function broadcastRoomState(room: RoomData) {
+  const hostTeam = Array.from(room.teams.values()).find((t) => t.tableNumber === 1 || t.members.includes('Kvízmistr') || t.ws === room.hostWs);
+  const hostRoomState = getRoomState(room, hostTeam?.id || null);
   const payloadForHost = JSON.stringify({
     type: 'ROOM_UPDATE',
-    room: {
-      code: room.code,
-      status: room.status,
-      teams: teamsArray,
-      currentRoundIndex: room.currentRoundIndex,
-      currentQuestionIndex: room.currentQuestionIndex,
-      totalQuestions,
-      currentQuestion: currentQuestion,
-      timerSeconds: room.timerSeconds,
-      startCountdown: room.startCountdown,
-      fastestCorrectTeam: room.status === 'REVEAL' || room.status === 'FINAL_RESULTS' ? room.fastestCorrectTeam : null,
-      waitingForTeamsCount,
-      allAnswered,
-      myTeamId: Array.from(room.teams.values()).find((t) => t.ws === room.hostWs)?.id || null,
-    },
+    room: hostRoomState,
   });
 
   if (room.hostWs && room.hostWs.readyState === WebSocket.OPEN) {
@@ -293,28 +299,10 @@ function broadcastRoomState(room: RoomData) {
   // Odeslání každému týmu zvlášť (pokud není shodný s hostWs, aby nedostal zprávu dvakrát)
   room.teams.forEach((team) => {
     if (team.ws && team.ws.readyState === WebSocket.OPEN && team.ws !== room.hostWs) {
-      const teamTeamsArray = teamsArray.map((t) => ({
-        ...t,
-        selectedOption: t.id === team.id ? team.selectedOption : t.selectedOption,
-      }));
-
+      const teamRoomState = getRoomState(room, team.id);
       const payloadForTeam = JSON.stringify({
         type: 'ROOM_UPDATE',
-        room: {
-          code: room.code,
-          status: room.status,
-          teams: teamTeamsArray,
-          currentRoundIndex: room.currentRoundIndex,
-          currentQuestionIndex: room.currentQuestionIndex,
-          totalQuestions,
-          currentQuestion: currentQuestion,
-          timerSeconds: room.timerSeconds,
-          startCountdown: room.startCountdown,
-          myTeamId: team.id,
-          fastestCorrectTeam: room.status === 'REVEAL' || room.status === 'FINAL_RESULTS' ? room.fastestCorrectTeam : null,
-          waitingForTeamsCount,
-          allAnswered,
-        },
+        room: teamRoomState,
       });
 
       try {
@@ -331,6 +319,24 @@ function stopRoomTimer(room: RoomData) {
     clearInterval(room.timerInterval);
     room.timerInterval = null;
   }
+}
+
+function startRoomCountdown(room: RoomData) {
+  if (room.teams.size < 1) return;
+  stopRoomTimer(room);
+  room.status = 'STARTING';
+  room.startCountdown = 3;
+  broadcastRoomState(room);
+
+  const startInterval = setInterval(() => {
+    room.startCountdown -= 1;
+    if (room.startCountdown <= 0) {
+      clearInterval(startInterval);
+      start20sQuestionTimer(room);
+    } else {
+      broadcastRoomState(room);
+    }
+  }, 1000);
 }
 
 function start20sQuestionTimer(room: RoomData) {
@@ -442,18 +448,226 @@ function finishGameAndAnnounceWinners(room: RoomData) {
   broadcastRoomState(room);
 }
 
-// REST API pro rychlou kontrolu existující místnosti
-app.get('/api/room/:code', (req, res) => {
-  const code = req.params.code.toUpperCase();
-  const room = rooms.get(code);
-  if (!room) {
-    return res.status(404).json({ error: 'Místnost nebyla nalezena.' });
+// ==========================================
+// REST API PRO SPOLEHLIVÝ PROVOZ NA MOBILECH
+// Zajišťuje 100% funkčnost i v případě, že mobilní síť (5G/LTE/proxy) omezuje WebSockety
+// ==========================================
+app.get('/api/health', (_req, res) => {
+  res.json({ status: 'ok', serverTime: Date.now() });
+});
+
+// 1. Založení nové místnosti přes HTTP
+app.post('/api/rooms/create', (req, res) => {
+  try {
+    const { rounds: customRounds, forceRandom, hostTeamName, hostMembers } = req.body || {};
+    const code = generateRoomCode();
+    const selectedRounds = customRounds && customRounds.length > 0 && !forceRandom
+      ? customRounds 
+      : generateRandomQuizRounds({ roundsCount: 5, questionsPerRound: 5, shuffleOptions: true });
+
+    const newRoom: RoomData = {
+      code,
+      status: 'LOBBY',
+      teams: new Map(),
+      hostWs: null,
+      rounds: selectedRounds,
+      currentRoundIndex: 0,
+      currentQuestionIndex: 0,
+      timerSeconds: 20,
+      startCountdown: 3,
+      questionStartTime: 0,
+      fastestCorrectTeam: null,
+    };
+
+    const hostTeamId = `team-host-${Date.now()}`;
+    const finalHostName = typeof hostTeamName === 'string' && hostTeamName.trim()
+      ? hostTeamName.trim()
+      : 'Stůl 1 (Kvízmistr)';
+    const finalMembers = Array.isArray(hostMembers) && hostMembers.length > 0
+      ? hostMembers.map((m: any) => String(m).trim()).filter(Boolean)
+      : ['Kvízmistr'];
+
+    const hostTeam: TeamSession = {
+      id: hostTeamId,
+      name: finalHostName,
+      members: finalMembers,
+      tableNumber: 1,
+      score: 0,
+      selectedOption: null,
+      hasAnswered: false,
+      answeredAt: null,
+      responseTimeMs: null,
+      earnedBonusPoint: false,
+      pointsEarnedThisQuestion: 0,
+      isWinner: false,
+      ws: null,
+    };
+
+    newRoom.teams.set(hostTeamId, hostTeam);
+    rooms.set(code, newRoom);
+
+    const roomState = getRoomState(newRoom, hostTeamId);
+    return res.json({ success: true, code, hostTeamId, room: roomState });
+  } catch (err: any) {
+    console.error('Chyba při HTTP zakládání místnosti:', err);
+    return res.status(500).json({ success: false, error: err?.message || 'Chyba při zakládání místnosti' });
   }
-  res.json({
-    code: room.code,
-    status: room.status,
-    teamCount: room.teams.size,
-  });
+});
+
+// 2. Připojení týmu přes HTTP
+app.post('/api/rooms/join', (req, res) => {
+  try {
+    const { code: rawCode, teamName, members } = req.body || {};
+    const code = String(rawCode || '').trim().toUpperCase();
+    const room = rooms.get(code);
+
+    if (!room) {
+      return res.status(404).json({ success: false, error: 'Místnost s tímto kódem neexistuje.' });
+    }
+    if (room.status !== 'LOBBY') {
+      return res.status(400).json({ success: false, error: 'Kvíz už byl zahájen. Nové týmy se již nemohou přidat.' });
+    }
+    if (room.teams.size >= 10) {
+      return res.status(400).json({ success: false, error: 'Místnost je plná. Maximální kapacita je 10 stolů.' });
+    }
+
+    const teamId = `team-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+    const team: TeamSession = {
+      id: teamId,
+      name: String(teamName || '').trim() || `Stůl ${room.teams.size + 1}`,
+      members: Array.isArray(members) && members.length > 0 ? members.map((m: any) => String(m).trim()).filter(Boolean) : ['Hráč 1'],
+      tableNumber: room.teams.size + 1,
+      score: 0,
+      selectedOption: null,
+      hasAnswered: false,
+      answeredAt: null,
+      responseTimeMs: null,
+      earnedBonusPoint: false,
+      pointsEarnedThisQuestion: 0,
+      isWinner: false,
+      ws: null,
+    };
+
+    room.teams.set(teamId, team);
+    broadcastRoomState(room);
+
+    const roomState = getRoomState(room, teamId);
+    return res.json({ success: true, teamId, room: roomState });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err?.message || 'Chyba při připojování týmu' });
+  }
+});
+
+// 3. Získání aktuálního stavu místnosti přes HTTP (polling pro mobilní telefony)
+app.get('/api/rooms/:code', (req, res) => {
+  const code = String(req.params.code || '').trim().toUpperCase();
+  const myTeamId = (req.query.myTeamId as string) || null;
+  const room = rooms.get(code);
+
+  if (!room) {
+    return res.status(404).json({ success: false, error: 'Místnost nebyla nalezena.' });
+  }
+
+  return res.json({ success: true, room: getRoomState(room, myTeamId) });
+});
+
+// 4. Provedení herní akce přes HTTP
+app.post('/api/rooms/:code/action', (req, res) => {
+  try {
+    const code = String(req.params.code || '').trim().toUpperCase();
+    const room = rooms.get(code);
+
+    if (!room) {
+      return res.status(404).json({ success: false, error: 'Místnost nebyla nalezena.' });
+    }
+
+    const { type, teamId, optionIndex, isFinal, name, members } = req.body || {};
+
+    switch (type) {
+      case 'START_GAME':
+        startRoomCountdown(room);
+        break;
+
+      case 'NEXT_QUESTION': {
+        const questionsInCurrentRound = room.rounds[room.currentRoundIndex]?.questions || [];
+        if (room.currentQuestionIndex < questionsInCurrentRound.length - 1) {
+          room.currentQuestionIndex += 1;
+          start20sQuestionTimer(room);
+        } else if (room.currentRoundIndex < room.rounds.length - 1) {
+          room.currentRoundIndex += 1;
+          room.currentQuestionIndex = 0;
+          start20sQuestionTimer(room);
+        } else {
+          finishGameAndAnnounceWinners(room);
+        }
+        break;
+      }
+
+      case 'REVEAL_NOW':
+        revealQuestionAnswer(room);
+        break;
+
+      case 'RESTART_ROOM':
+        stopRoomTimer(room);
+        room.status = 'LOBBY';
+        room.currentRoundIndex = 0;
+        room.currentQuestionIndex = 0;
+        room.timerSeconds = 20;
+        room.fastestCorrectTeam = null;
+        room.rounds = generateRandomQuizRounds({ roundsCount: 5, questionsPerRound: 5, shuffleOptions: true });
+        room.teams.forEach((t) => {
+          t.score = 0;
+          t.selectedOption = null;
+          t.hasAnswered = false;
+          t.answeredAt = null;
+          t.responseTimeMs = null;
+          t.earnedBonusPoint = false;
+          t.pointsEarnedThisQuestion = 0;
+          t.isWinner = false;
+        });
+        broadcastRoomState(room);
+        break;
+
+      case 'RESHUFFLE_QUESTIONS':
+        if (room.status === 'LOBBY') {
+          room.rounds = generateRandomQuizRounds({ roundsCount: 5, questionsPerRound: 5, shuffleOptions: true });
+          broadcastRoomState(room);
+        }
+        break;
+
+      case 'UPDATE_TEAM': {
+        const team = room.teams.get(teamId);
+        if (team) {
+          if (typeof name === 'string' && name.trim()) team.name = name.trim();
+          if (Array.isArray(members) && members.length > 0) {
+            const cleaned = members.map((m: any) => String(m).trim()).filter(Boolean);
+            if (cleaned.length > 0) team.members = cleaned.slice(0, 10);
+          }
+          broadcastRoomState(room);
+        }
+        break;
+      }
+
+      case 'SUBMIT_ANSWER': {
+        const effectiveTeamId = teamId || Array.from(room.teams.keys())[0];
+        const team = effectiveTeamId ? room.teams.get(effectiveTeamId) : null;
+        if (team && room.status === 'QUESTION') {
+          team.selectedOption = typeof optionIndex === 'number' ? optionIndex : null;
+          if (isFinal) {
+            team.hasAnswered = true;
+            team.answeredAt = Date.now();
+            team.responseTimeMs = room.questionStartTime > 0 ? Date.now() - room.questionStartTime : null;
+          }
+          broadcastRoomState(room);
+        }
+        break;
+      }
+    }
+
+    return res.json({ success: true, room: getRoomState(room, teamId) });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err?.message || 'Chyba při provádění akce' });
+  }
 });
 
 async function startServer() {
@@ -689,20 +903,7 @@ async function startServer() {
               return;
             }
 
-            // Společný start kvízu s odpočtem 3, 2, 1
-            room.status = 'STARTING';
-            room.startCountdown = 3;
-            broadcastRoomState(room);
-
-            const startInterval = setInterval(() => {
-              room.startCountdown -= 1;
-              if (room.startCountdown <= 0) {
-                clearInterval(startInterval);
-                start20sQuestionTimer(room);
-              } else {
-                broadcastRoomState(room);
-              }
-            }, 1000);
+            startRoomCountdown(room);
             break;
           }
 

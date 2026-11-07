@@ -80,6 +80,7 @@ export interface MultiplayerRoomState {
   fastestCorrectTeam?: FastestCorrectTeamInfo | null;
   waitingForTeamsCount?: number;
   allAnswered?: boolean;
+  myTeamId?: string | null;
 }
 
 export type AppView = 

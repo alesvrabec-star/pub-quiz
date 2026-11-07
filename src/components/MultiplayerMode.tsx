@@ -36,6 +36,8 @@ export const MultiplayerMode: React.FC<MultiplayerModeProps> = ({ rounds, initia
   const [inputMembers, setInputMembers] = useState<string[]>(['Pepa', 'Honza']);
   const [newMemberName, setNewMemberName] = useState('');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isHttpFallback, setIsHttpFallback] = useState(false);
 
   // Úprava stolu / týmu Kvízmistra i ostatních stolů
   const [isEditingTeamModalOpen, setIsEditingTeamModalOpen] = useState(false);
@@ -158,7 +160,139 @@ export const MultiplayerMode: React.FC<MultiplayerModeProps> = ({ rounds, initia
     }).catch(() => {});
   };
 
-  // Stabilní připojení WebSocketu pro celou herní seanci (neukončuje se při změně myTeamId)
+  // Pomocná funkce pro aplikaci aktualizace stavu místnosti (volá se z WebSocketu i z HTTP dotazů)
+  const applyRoomStateUpdate = (room: MultiplayerRoomState, forceMyTeamId?: string) => {
+    // Zvuková notifikace při příchodu nového týmu do lobby
+    if (room.status === 'LOBBY') {
+      if (prevTeamsCountRef.current > 0 && room.teams.length > prevTeamsCountRef.current) {
+        pubAudio.playBeerClink();
+      }
+      prevTeamsCountRef.current = room.teams.length;
+    }
+
+    // Pokud přichází nová otázka nebo se stav mění na QUESTION, vyčistit starou označenou odpověď
+    if (
+      room.status === 'QUESTION' &&
+      (room.currentQuestion?.id !== roomStateRef.current?.currentQuestion?.id ||
+       room.currentQuestionIndex !== roomStateRef.current?.currentQuestionIndex ||
+       room.currentRoundIndex !== roomStateRef.current?.currentRoundIndex ||
+       roomStateRef.current?.status !== 'QUESTION')
+    ) {
+      setLocalSelectedOption(null);
+    }
+
+    setRoomState(room);
+    const resolvedTeamId = forceMyTeamId || room.myTeamId;
+    if (resolvedTeamId) {
+      setMyTeamId(resolvedTeamId);
+      myTeamIdRef.current = resolvedTeamId;
+    }
+
+    // Automatické předčítání otázky nahlas při přechodu na QUESTION
+    if (room.status === 'QUESTION' && room.currentQuestion) {
+      if (lastSpokenQuestionId.current !== room.currentQuestion.id) {
+        lastSpokenQuestionId.current = room.currentQuestion.id;
+        pubAudio.playTavernBell();
+        if (pubSpeech.getEnabled()) {
+          pubSpeech.speakQuestion(room.currentQuestion.question, room.currentQuestion.options);
+        }
+      }
+    }
+
+    // Zvukový tikot vteřin
+    if (room.status === 'QUESTION' && room.timerSeconds <= 5 && room.timerSeconds > 0) {
+      pubAudio.playTick();
+    }
+
+    // Zvuk při získání bonusového bodu za nejrychlejší správnou odpověď
+    const activeTeamId = myTeamIdRef.current || resolvedTeamId;
+    const myTeamInRoom = room.teams.find((t: MultiplayerTeam) => t.id === activeTeamId);
+    if (room.status === 'REVEAL' && myTeamInRoom?.earnedBonusPoint && !hadBonusSoundRef.current) {
+      hadBonusSoundRef.current = true;
+      pubAudio.playBeerClink();
+    } else if (room.status === 'QUESTION') {
+      hadBonusSoundRef.current = false;
+    }
+
+    // Gong při vypršení času
+    if (room.status === 'REVEAL' && lastSpokenQuestionId.current) {
+      pubSpeech.cancel();
+    }
+
+    // Vyhlášení vítězů - Zařízení výherního týmu začne houkat!
+    if (room.status === 'FINAL_RESULTS') {
+      const currentTeamId = myTeamIdRef.current || resolvedTeamId;
+      const winningTeam = room.teams.find((t) => t.isWinner);
+      const amIWinner = currentTeamId && winningTeam && winningTeam.id === currentTeamId;
+
+      if (amIWinner && !hasHonkedRef.current) {
+        hasHonkedRef.current = true;
+        setIsHonking(true);
+        pubAudio.playVictorySiren();
+      } else if (!amIWinner && !hasHonkedRef.current) {
+        hasHonkedRef.current = true;
+        pubAudio.playFanfare();
+      }
+    } else {
+      hasHonkedRef.current = false;
+      setIsHonking(false);
+    }
+  };
+
+  // Odeslání herní akce: Primárně přes WebSocket, při jeho výpadku okamžitý HTTP REST fallback
+  const sendRoomAction = async (action: any) => {
+    const socket = wsRef.current || ws;
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify(action));
+      return;
+    }
+
+    if (roomState?.code) {
+      try {
+        const res = await fetch(`/api/rooms/${roomState.code}/action`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(action),
+        });
+        const data = await res.json();
+        if (data.success && data.room) {
+          applyRoomStateUpdate(data.room);
+        }
+      } catch (err) {
+        console.warn('HTTP fallback action error:', err);
+      }
+    }
+  };
+
+  // HTTP Polling fallback pro mobilní telefony a nestabilní připojení
+  useEffect(() => {
+    if (!roomState?.code) return;
+
+    const interval = setInterval(async () => {
+      const socket = wsRef.current || ws;
+      if (!socket || socket.readyState !== WebSocket.OPEN) {
+        setIsHttpFallback(true);
+        try {
+          const teamParam = myTeamIdRef.current ? `?myTeamId=${encodeURIComponent(myTeamIdRef.current)}` : '';
+          const res = await fetch(`/api/rooms/${roomState.code}${teamParam}`);
+          if (res.ok) {
+            const data = await res.json();
+            if (data.success && data.room) {
+              applyRoomStateUpdate(data.room);
+            }
+          }
+        } catch {
+          // dočasný výpadek
+        }
+      } else {
+        setIsHttpFallback(false);
+      }
+    }, 1200);
+
+    return () => clearInterval(interval);
+  }, [roomState?.code]);
+
+  // Stabilní připojení WebSocketu pro celou herní seanci s podporou URL parametrů
   useEffect(() => {
     isUnmountedRef.current = false;
 
@@ -166,146 +300,80 @@ export const MultiplayerMode: React.FC<MultiplayerModeProps> = ({ rounds, initia
       if (isUnmountedRef.current) return;
 
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = `${protocol}//${window.location.host}/ws`;
-      const socket = new WebSocket(wsUrl);
-      wsRef.current = socket;
-      setWs(socket);
+      const search = window.location.search || '';
+      const wsUrl = `${protocol}//${window.location.host}/ws${search}`;
+      
+      try {
+        const socket = new WebSocket(wsUrl);
+        wsRef.current = socket;
+        setWs(socket);
 
-      socket.onopen = () => {
-        if (isUnmountedRef.current) {
-          socket.close();
-          return;
-        }
-        setIsConnected(true);
-        setErrorMessage(null);
-
-        // Pokud už jsme byli v místnosti, okamžitě obnovíme spojení na serveru
-        if (roomStateRef.current?.code) {
-          socket.send(JSON.stringify({
-            type: 'RECONNECT',
-            code: roomStateRef.current.code,
-            role: roleRef.current,
-            myTeamId: myTeamIdRef.current,
-          }));
-        }
-      };
-
-      socket.onerror = (e) => {
-        console.warn('Hospodský WebSocket stav:', e);
-      };
-
-      socket.onmessage = (event) => {
-        try {
-          const msg = JSON.parse(event.data);
-
-          if (msg.type === 'ROOM_UPDATE') {
-            const room = msg.room as MultiplayerRoomState;
-
-            // Zvuková notifikace při příchodu nového týmu do lobby
-            if (room.status === 'LOBBY') {
-              if (prevTeamsCountRef.current > 0 && room.teams.length > prevTeamsCountRef.current) {
-                pubAudio.playBeerClink();
-              }
-              prevTeamsCountRef.current = room.teams.length;
-            }
-
-            // Pokud přichází nová otázka nebo se stav mění na QUESTION, vyčistit starou označenou odpověď
-            if (
-              room.status === 'QUESTION' &&
-              (room.currentQuestion?.id !== roomStateRef.current?.currentQuestion?.id ||
-               room.currentQuestionIndex !== roomStateRef.current?.currentQuestionIndex ||
-               room.currentRoundIndex !== roomStateRef.current?.currentRoundIndex ||
-               roomStateRef.current?.status !== 'QUESTION')
-            ) {
-              setLocalSelectedOption(null);
-            }
-
-            setRoomState(room);
-            if (msg.room.myTeamId) {
-              setMyTeamId(msg.room.myTeamId);
-              myTeamIdRef.current = msg.room.myTeamId;
-            }
-
-            // Automatické předčítání otázky nahlas při přechodu na QUESTION
-            if (room.status === 'QUESTION' && room.currentQuestion) {
-              if (lastSpokenQuestionId.current !== room.currentQuestion.id) {
-                lastSpokenQuestionId.current = room.currentQuestion.id;
-                pubAudio.playTavernBell();
-                if (pubSpeech.getEnabled()) {
-                  pubSpeech.speakQuestion(room.currentQuestion.question, room.currentQuestion.options);
-                }
-              }
-            }
-
-            // Zvukový tikot vteřin
-            if (room.status === 'QUESTION' && room.timerSeconds <= 5 && room.timerSeconds > 0) {
-              pubAudio.playTick();
-            }
-
-            // Zvuk při získání bonusového bodu za nejrychlejší správnou odpověď
-            const activeTeamId = myTeamIdRef.current || msg.room.myTeamId;
-            const myTeamInRoom = room.teams.find((t: MultiplayerTeam) => t.id === activeTeamId);
-            if (room.status === 'REVEAL' && myTeamInRoom?.earnedBonusPoint && !hadBonusSoundRef.current) {
-              hadBonusSoundRef.current = true;
-              pubAudio.playBeerClink();
-            } else if (room.status === 'QUESTION') {
-              hadBonusSoundRef.current = false;
-            }
-
-            // Gong při vypršení času
-            if (room.status === 'REVEAL' && lastSpokenQuestionId.current) {
-              pubSpeech.cancel();
-            }
-
-            // Vyhlášení vítězů - Zařízení výherního týmu začne houkat!
-            if (room.status === 'FINAL_RESULTS') {
-              const currentTeamId = myTeamIdRef.current || msg.room.myTeamId;
-              const winningTeam = room.teams.find((t) => t.isWinner);
-              const amIWinner = currentTeamId && winningTeam && winningTeam.id === currentTeamId;
-
-              if (amIWinner && !hasHonkedRef.current) {
-                hasHonkedRef.current = true;
-                setIsHonking(true);
-                pubAudio.playVictorySiren();
-              } else if (!amIWinner && !hasHonkedRef.current) {
-                hasHonkedRef.current = true;
-                pubAudio.playFanfare();
-              }
-            } else {
-              hasHonkedRef.current = false;
-              setIsHonking(false);
-            }
-          } else if (msg.type === 'TEAM_JOINED') {
-            setMyTeamId(msg.teamId);
-            myTeamIdRef.current = msg.teamId;
-            setRole('TEAM_VIEW');
-            pubAudio.playBeerClink();
-          } else if (msg.type === 'ROOM_CREATED') {
-            setRole('HOST_VIEW');
-            if (msg.hostTeamId) {
-              setMyTeamId(msg.hostTeamId);
-              myTeamIdRef.current = msg.hostTeamId;
-            }
-            pubAudio.playTavernBell();
-          } else if (msg.type === 'ERROR') {
-            setErrorMessage(msg.message);
-            pubAudio.playWoodThud();
+        socket.onopen = () => {
+          if (isUnmountedRef.current) {
+            socket.close();
+            return;
           }
-        } catch (err) {
-          console.error('WebSocket parse error:', err);
-        }
-      };
+          setIsConnected(true);
+          setIsHttpFallback(false);
+          setErrorMessage(null);
 
-      socket.onclose = () => {
+          // Pokud už jsme byli v místnosti, okamžitě obnovíme spojení na serveru
+          if (roomStateRef.current?.code) {
+            socket.send(JSON.stringify({
+              type: 'RECONNECT',
+              code: roomStateRef.current.code,
+              role: roleRef.current,
+              myTeamId: myTeamIdRef.current,
+            }));
+          }
+        };
+
+        socket.onerror = (e) => {
+          console.warn('Hospodský WebSocket stav (přepínám na HTTP spojení):', e);
+          setIsHttpFallback(true);
+        };
+
+        socket.onmessage = (event) => {
+          try {
+            const msg = JSON.parse(event.data);
+            if (msg.type === 'ROOM_UPDATE') {
+              applyRoomStateUpdate(msg.room as MultiplayerRoomState);
+            } else if (msg.type === 'TEAM_JOINED') {
+              setMyTeamId(msg.teamId);
+              myTeamIdRef.current = msg.teamId;
+              setRole('TEAM_VIEW');
+              pubAudio.playBeerClink();
+            } else if (msg.type === 'ROOM_CREATED') {
+              setRole('HOST_VIEW');
+              if (msg.hostTeamId) {
+                setMyTeamId(msg.hostTeamId);
+                myTeamIdRef.current = msg.hostTeamId;
+              }
+              pubAudio.playTavernBell();
+            } else if (msg.type === 'ERROR') {
+              setErrorMessage(msg.message);
+              pubAudio.playWoodThud();
+            }
+          } catch (err) {
+            console.error('WebSocket parse error:', err);
+          }
+        };
+
+        socket.onclose = () => {
+          setIsConnected(false);
+          setIsHttpFallback(true);
+          if (!isUnmountedRef.current) {
+            if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
+            reconnectTimeoutRef.current = setTimeout(() => {
+              connectWebSocket();
+            }, 2000);
+          }
+        };
+      } catch (err) {
+        console.warn('WebSocket init exception, používám HTTP fallback:', err);
         setIsConnected(false);
-        if (!isUnmountedRef.current) {
-          // Automatické znovupřipojení při výpadku spojení
-          if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
-          reconnectTimeoutRef.current = setTimeout(() => {
-            connectWebSocket();
-          }, 1500);
-        }
-      };
+        setIsHttpFallback(true);
+      }
     }
 
     connectWebSocket();
@@ -322,17 +390,47 @@ export const MultiplayerMode: React.FC<MultiplayerModeProps> = ({ rounds, initia
     };
   }, []);
 
-  // Vytvoření místnosti (Kvízmistr) - při každém novém kvízu nová sada náhodných otázek
-  const handleCreateRoom = () => {
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  // Vytvoření místnosti (Kvízmistr) - funguje přes WebSocket i okamžitý HTTP REST fallback pro mobily
+  const handleCreateRoom = async () => {
+    setIsSubmitting(true);
+    setErrorMessage(null);
     const freshRounds = generateRandomQuizRounds({ roundsCount: 5, questionsPerRound: 5, shuffleOptions: true });
-    ws.send(JSON.stringify({
+    const payload = {
       type: 'CREATE_ROOM',
       rounds: freshRounds,
       forceRandom: true,
       hostTeamName: hostInitialTeamName.trim() || 'Stůl 1 (Kvízmistr)',
       hostMembers: hostInitialMembers.length > 0 ? hostInitialMembers : ['Kvízmistr'],
-    }));
+    };
+
+    const socket = wsRef.current || ws;
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify(payload));
+      setIsSubmitting(false);
+      return;
+    }
+
+    // Okamžitý HTTP REST fallback (garantovaně funguje na mobilních sítích a iPhone Safari)
+    try {
+      const res = await fetch('/api/rooms/create', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json();
+      if (data.success && data.room) {
+        applyRoomStateUpdate(data.room, data.hostTeamId);
+        setRole('HOST_VIEW');
+        setIsHttpFallback(true);
+        pubAudio.playTavernBell();
+      } else {
+        setErrorMessage(data.error || 'Nepodařilo se vytvořit místnost.');
+      }
+    } catch {
+      setErrorMessage('Chyba spojení se serverem. Zkontrolujte připojení.');
+    } finally {
+      setIsSubmitting(false);
+    }
   };
 
   // Otevření okna pro úpravu stolu / týmu
@@ -345,7 +443,7 @@ export const MultiplayerMode: React.FC<MultiplayerModeProps> = ({ rounds, initia
     setIsEditingTeamModalOpen(true);
   };
 
-  // Uložení úpravy stolu / týmu (odeslání přes WebSocket)
+  // Uložení úpravy stolu / týmu
   const handleSaveTeamEdit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!editTeamName.trim()) {
@@ -356,16 +454,15 @@ export const MultiplayerMode: React.FC<MultiplayerModeProps> = ({ rounds, initia
       setEditErrorMessage('Přidejte alespoň 1 člena týmu (1 až 10).');
       return;
     }
-    const socket = wsRef.current || ws;
-    if (!socket || !roomState || !editingTeamId) return;
+    if (!roomState || !editingTeamId) return;
 
-    socket.send(JSON.stringify({
+    sendRoomAction({
       type: 'UPDATE_TEAM',
       code: roomState.code,
       teamId: editingTeamId,
       name: editTeamName.trim(),
       members: editTeamMembers,
-    }));
+    });
 
     pubAudio.playBeerClink();
     setIsEditingTeamModalOpen(false);
@@ -392,27 +489,37 @@ export const MultiplayerMode: React.FC<MultiplayerModeProps> = ({ rounds, initia
 
   // Vylosování jiné sady otázek pro aktuální místnost
   const handleReshuffleQuestions = () => {
-    const socket = wsRef.current || ws;
-    if (!socket || !roomState) return;
-    socket.send(JSON.stringify({ type: 'RESHUFFLE_QUESTIONS', code: roomState.code }));
+    sendRoomAction({ type: 'RESHUFFLE_QUESTIONS', code: roomState?.code });
     pubAudio.playBeerClink();
   };
 
   // Ruční synchronizace stavu místnosti ze serveru
-  const handleRefreshRoom = () => {
+  const handleRefreshRoom = async () => {
     const socket = wsRef.current || ws;
-    if (!socket || socket.readyState !== WebSocket.OPEN || !roomStateRef.current) return;
-    socket.send(JSON.stringify({
-      type: 'RECONNECT',
-      code: roomStateRef.current.code,
-      role: roleRef.current,
-      myTeamId: myTeamIdRef.current,
-    }));
+    if (socket && socket.readyState === WebSocket.OPEN && roomStateRef.current) {
+      socket.send(JSON.stringify({
+        type: 'RECONNECT',
+        code: roomStateRef.current.code,
+        role: roleRef.current,
+        myTeamId: myTeamIdRef.current,
+      }));
+    } else if (roomStateRef.current?.code) {
+      try {
+        const teamParam = myTeamIdRef.current ? `?myTeamId=${encodeURIComponent(myTeamIdRef.current)}` : '';
+        const res = await fetch(`/api/rooms/${roomStateRef.current.code}${teamParam}`);
+        if (res.ok) {
+          const data = await res.json();
+          if (data.success && data.room) {
+            applyRoomStateUpdate(data.room);
+          }
+        }
+      } catch {}
+    }
     pubAudio.playTick();
   };
 
-  // Připojení týmu k místnosti
-  const handleJoinTeam = (e: React.FormEvent) => {
+  // Připojení týmu k místnosti - funguje přes WebSocket i okamžitý HTTP REST fallback
+  const handleJoinTeam = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMessage(null);
     if (!inputRoomCode.trim()) {
@@ -428,17 +535,41 @@ export const MultiplayerMode: React.FC<MultiplayerModeProps> = ({ rounds, initia
       return;
     }
 
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
-      setErrorMessage('Chyba spojení se serverem. Zkuste obnovit stránku.');
-      return;
-    }
-
-    ws.send(JSON.stringify({
+    const payload = {
       type: 'JOIN_TEAM',
       code: inputRoomCode.trim().toUpperCase(),
       teamName: inputTeamName.trim(),
       members: inputMembers,
-    }));
+    };
+
+    const socket = wsRef.current || ws;
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify(payload));
+      return;
+    }
+
+    // Okamžitý HTTP fallback pro mobilní telefony
+    try {
+      setIsSubmitting(true);
+      const res = await fetch('/api/rooms/join', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json();
+      if (data.success && data.room) {
+        applyRoomStateUpdate(data.room, data.teamId);
+        setRole('TEAM_VIEW');
+        setIsHttpFallback(true);
+        pubAudio.playBeerClink();
+      } else {
+        setErrorMessage(data.error || 'Nepodařilo se připojit k místnosti.');
+      }
+    } catch {
+      setErrorMessage('Chyba spojení se serverem. Zkuste to znovu.');
+    } finally {
+      setIsSubmitting(false);
+    }
   };
 
   // Přidání člena týmu
@@ -458,57 +589,47 @@ export const MultiplayerMode: React.FC<MultiplayerModeProps> = ({ rounds, initia
 
   // Odeslání odpovědi týmu (okamžitá lokální volba s možností změny před vypršením času)
   const handleSelectAnswer = (optionIdx: number, isFinal: boolean = false) => {
-    if (!ws || ws.readyState !== WebSocket.OPEN || !roomState) return;
-    if (roomState.status !== 'QUESTION') return;
+    if (!roomState || roomState.status !== 'QUESTION') return;
 
-    // Pokud uživatel nemá myTeamId (např. hostitel v roli moderátora), použije se první dostupný tým místnosti
     let effectiveTeamId = myTeamId;
     if (!effectiveTeamId && roomState.teams.length > 0) {
       effectiveTeamId = roomState.teams[0].id;
       setMyTeamId(effectiveTeamId);
+      myTeamIdRef.current = effectiveTeamId;
     }
 
-    // Okamžitá lokální vizuální zpětná vazba pro hráče ("označeno")
     setLocalSelectedOption(optionIdx);
 
-    ws.send(JSON.stringify({
+    sendRoomAction({
       type: 'SUBMIT_ANSWER',
       code: roomState.code,
       teamId: effectiveTeamId,
       optionIndex: optionIdx,
       isFinal,
-    }));
+    });
     pubAudio.playBeerClink();
   };
 
   // Ovládání Kvízmistra
   const handleStartGame = () => {
     setLocalSelectedOption(null);
-    const socket = wsRef.current || ws;
-    if (!socket || !roomState) return;
-    socket.send(JSON.stringify({ type: 'START_GAME', code: roomState.code }));
+    sendRoomAction({ type: 'START_GAME', code: roomState?.code });
     pubAudio.playTavernBell();
   };
 
   const handleNextQuestion = () => {
     setLocalSelectedOption(null);
-    const socket = wsRef.current || ws;
-    if (!socket || !roomState) return;
-    socket.send(JSON.stringify({ type: 'NEXT_QUESTION', code: roomState.code }));
+    sendRoomAction({ type: 'NEXT_QUESTION', code: roomState?.code });
   };
 
   const handleForceReveal = () => {
-    const socket = wsRef.current || ws;
-    if (!socket || !roomState) return;
-    socket.send(JSON.stringify({ type: 'REVEAL_NOW', code: roomState.code }));
+    sendRoomAction({ type: 'REVEAL_NOW', code: roomState?.code });
     pubAudio.playTavernBell();
   };
 
   const handleRestartRoom = () => {
     setLocalSelectedOption(null);
-    const socket = wsRef.current || ws;
-    if (!socket || !roomState) return;
-    socket.send(JSON.stringify({ type: 'RESTART_ROOM', code: roomState.code }));
+    sendRoomAction({ type: 'RESTART_ROOM', code: roomState?.code });
     hasHonkedRef.current = false;
     setIsHonking(false);
   };
@@ -540,9 +661,23 @@ export const MultiplayerMode: React.FC<MultiplayerModeProps> = ({ rounds, initia
     return (
       <div className="max-w-4xl mx-auto px-4 py-12 space-y-12">
         <div className="text-center space-y-3">
-          <div className="inline-flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-amber-500">
-            <Radio className="w-4 h-4 text-amber-500 animate-pulse" />
-            <span>Společný hospodský kvíz na více zařízeních</span>
+          <div className="inline-flex items-center gap-3 text-xs font-semibold uppercase tracking-wider text-amber-500">
+            <span className="flex items-center gap-1.5">
+              <Radio className="w-4 h-4 text-amber-500 animate-pulse" />
+              <span>Společný hospodský kvíz na více zařízeních</span>
+            </span>
+            <span className="text-stone-600">·</span>
+            {isConnected ? (
+              <span className="inline-flex items-center gap-1 text-[11px] text-emerald-400 font-medium">
+                <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+                <span>Živě připojeno</span>
+              </span>
+            ) : (
+              <span className="inline-flex items-center gap-1 text-[11px] text-amber-400/90 font-medium">
+                <span className="w-2 h-2 rounded-full bg-amber-400" />
+                <span>Mobilní režim připraven</span>
+              </span>
+            )}
           </div>
           <h1 className="text-4xl md:text-5xl font-serif font-bold text-amber-100">
             2 až 10 týmů · Společný start & Výsledky
@@ -658,11 +793,20 @@ export const MultiplayerMode: React.FC<MultiplayerModeProps> = ({ rounds, initia
 
             <button
               onClick={handleCreateRoom}
-              disabled={!isConnected}
-              className="w-full py-4 bg-amber-500 hover:bg-amber-400 disabled:opacity-40 text-stone-950 font-serif font-bold text-base rounded-xl transition-all shadow-md flex items-center justify-center gap-2 cursor-pointer"
+              disabled={isSubmitting}
+              className="w-full py-4 bg-amber-500 hover:bg-amber-400 disabled:opacity-60 text-stone-950 font-serif font-bold text-base rounded-xl transition-all shadow-md flex items-center justify-center gap-2 cursor-pointer active:scale-98"
             >
-              <Crown className="w-5 h-5" />
-              <span>Vytvořit novou místnost</span>
+              {isSubmitting ? (
+                <>
+                  <RefreshCw className="w-5 h-5 animate-spin" />
+                  <span>Vytvářím novou místnost...</span>
+                </>
+              ) : (
+                <>
+                  <Crown className="w-5 h-5" />
+                  <span>Vytvořit novou místnost</span>
+                </>
+              )}
             </button>
           </div>
 
@@ -818,10 +962,20 @@ export const MultiplayerMode: React.FC<MultiplayerModeProps> = ({ rounds, initia
 
             <button
               type="submit"
-              className="w-full py-4 bg-amber-500 hover:bg-amber-400 text-stone-950 font-serif font-bold text-base rounded-xl transition-all shadow-lg flex items-center justify-center gap-2 mt-4"
+              disabled={isSubmitting}
+              className="w-full py-4 bg-amber-500 hover:bg-amber-400 disabled:opacity-60 text-stone-950 font-serif font-bold text-base rounded-xl transition-all shadow-lg flex items-center justify-center gap-2 mt-4 cursor-pointer active:scale-98"
             >
-              <span>Vstoupit do kvízové místnosti</span>
-              <ArrowRight className="w-5 h-5" />
+              {isSubmitting ? (
+                <>
+                  <RefreshCw className="w-5 h-5 animate-spin" />
+                  <span>Připojování ke stolu...</span>
+                </>
+              ) : (
+                <>
+                  <span>Vstoupit do kvízové místnosti</span>
+                  <ArrowRight className="w-5 h-5" />
+                </>
+              )}
             </button>
           </form>
         </div>
@@ -849,6 +1003,18 @@ export const MultiplayerMode: React.FC<MultiplayerModeProps> = ({ rounds, initia
             <div className="inline-flex items-center gap-2 text-xs font-semibold uppercase tracking-widest text-amber-500">
               <Radio className="w-4 h-4 animate-pulse text-emerald-400" />
               <span>Hospodská kvízová místnost připravena</span>
+              <span className="text-stone-600">·</span>
+              {isConnected ? (
+                <span className="text-emerald-400 font-mono text-[11px] font-normal flex items-center gap-1">
+                  <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+                  <span>Živě</span>
+                </span>
+              ) : (
+                <span className="text-amber-400 font-mono text-[11px] font-normal flex items-center gap-1">
+                  <span className="w-2 h-2 rounded-full bg-amber-400" />
+                  <span>Mobilní spojení</span>
+                </span>
+              )}
             </div>
             <div className="text-xs text-stone-400 flex items-center gap-2">
               <Smartphone className="w-4 h-4 text-amber-400" />
