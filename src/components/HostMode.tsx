@@ -49,6 +49,12 @@ export const HostMode: React.FC<HostModeProps> = ({
     }
   };
 
+  // Automatický reset označené možnosti a skrytí řešení při přechodu na jinou otázku nebo kolo
+  useEffect(() => {
+    setSelectedOptionIndex(null);
+    setShowAnswer(false);
+  }, [selectedRoundIndex, selectedQuestionIndex]);
+
   // Časovač efekt
   useEffect(() => {
     let interval: ReturnType<typeof setInterval> | null = null;

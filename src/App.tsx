@@ -11,7 +11,24 @@ import { MultiplayerMode } from './components/MultiplayerMode';
 import { pubAudio } from './utils/audio';
 
 export default function App() {
-  const [currentView, setCurrentView] = useState<AppView>('home');
+  const [initialJoinCode] = useState<string | null>(() => {
+    if (typeof window !== 'undefined') {
+      const params = new URLSearchParams(window.location.search);
+      const code = params.get('join') || params.get('room') || params.get('code');
+      return code ? code.trim().toUpperCase() : null;
+    }
+    return null;
+  });
+
+  const [currentView, setCurrentView] = useState<AppView>(() => {
+    if (typeof window !== 'undefined') {
+      const params = new URLSearchParams(window.location.search);
+      if (params.get('join') || params.get('room') || params.get('code')) {
+        return 'multiplayer';
+      }
+    }
+    return 'home';
+  });
   const [rounds, setRounds] = useState<QuizRound[]>(() => {
     const saved = localStorage.getItem('hospodsky_kviz_rounds');
     if (saved) {
@@ -103,7 +120,7 @@ export default function App() {
         )}
 
         {currentView === 'multiplayer' && (
-          <MultiplayerMode rounds={rounds} />
+          <MultiplayerMode rounds={rounds} initialJoinCode={initialJoinCode} />
         )}
 
         {currentView === 'host' && (

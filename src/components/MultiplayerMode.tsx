@@ -1,9 +1,12 @@
 import React, { useState, useEffect, useRef } from 'react';
+import QRCode from 'qrcode';
 import { QuizRound, MultiplayerRoomState, MultiplayerTeam } from '../types/quiz';
 import { 
   Users, Play, Volume2, VolumeX, Trophy, AlertTriangle, 
   Crown, ArrowRight, UserPlus, X, Check, CheckCircle2, Megaphone, Radio,
-  Clock, ShieldAlert, Sparkles, RefreshCw, Zap
+  Clock, ShieldAlert, Sparkles, RefreshCw, Zap,
+  QrCode, Maximize2, Minimize2, Copy, Smartphone, ExternalLink,
+  Edit3
 } from 'lucide-react';
 import { pubAudio } from '../utils/audio';
 import { pubSpeech } from '../utils/speech';
@@ -12,12 +15,15 @@ import { generateRandomQuizRounds } from '../data/questionPool';
 
 interface MultiplayerModeProps {
   rounds: QuizRound[];
+  initialJoinCode?: string | null;
 }
 
 type ClientRole = 'SELECT_ROLE' | 'HOST_VIEW' | 'TEAM_VIEW';
 
-export const MultiplayerMode: React.FC<MultiplayerModeProps> = ({ rounds }) => {
-  const [role, setRole] = useState<ClientRole>('SELECT_ROLE');
+export const MultiplayerMode: React.FC<MultiplayerModeProps> = ({ rounds, initialJoinCode }) => {
+  const [role, setRole] = useState<ClientRole>(() => {
+    return initialJoinCode ? 'TEAM_VIEW' : 'SELECT_ROLE';
+  });
   const [ws, setWs] = useState<WebSocket | null>(null);
   const [isConnected, setIsConnected] = useState(false);
   const [roomState, setRoomState] = useState<MultiplayerRoomState | null>(null);
@@ -25,11 +31,31 @@ export const MultiplayerMode: React.FC<MultiplayerModeProps> = ({ rounds }) => {
   const [localSelectedOption, setLocalSelectedOption] = useState<number | null>(null);
 
   // Form pro připojení týmu
-  const [inputRoomCode, setInputRoomCode] = useState('');
+  const [inputRoomCode, setInputRoomCode] = useState(initialJoinCode || '');
   const [inputTeamName, setInputTeamName] = useState('');
   const [inputMembers, setInputMembers] = useState<string[]>(['Pepa', 'Honza']);
   const [newMemberName, setNewMemberName] = useState('');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+
+  // Úprava stolu / týmu Kvízmistra i ostatních stolů
+  const [isEditingTeamModalOpen, setIsEditingTeamModalOpen] = useState(false);
+  const [editingTeamId, setEditingTeamId] = useState<string | null>(null);
+  const [editTeamName, setEditTeamName] = useState('');
+  const [editTeamMembers, setEditTeamMembers] = useState<string[]>([]);
+  const [newEditMemberName, setNewEditMemberName] = useState('');
+  const [editErrorMessage, setEditErrorMessage] = useState<string | null>(null);
+
+  // Volitelné přednastavení stolu Kvízmistra před založením
+  const [hostInitialTeamName, setHostInitialTeamName] = useState('Stůl 1 (Kvízmistr)');
+  const [hostInitialMembers, setHostInitialMembers] = useState<string[]>(['Kvízmistr']);
+  const [newHostMemberName, setNewHostMemberName] = useState('');
+  const [showHostCustomization, setShowHostCustomization] = useState(false);
+
+  // QR kód pro okamžité připojení mobilů
+  const [qrCodeDataUrl, setQrCodeDataUrl] = useState<string | null>(null);
+  const [isQrModalOpen, setIsQrModalOpen] = useState(false);
+  const [hasCopiedLink, setHasCopiedLink] = useState(false);
+  const [hasCopiedCode, setHasCopiedCode] = useState(false);
 
   // Zvuk a předčítání
   const [isSpeechEnabled, setIsSpeechEnabled] = useState(pubSpeech.getEnabled());
@@ -60,6 +86,16 @@ export const MultiplayerMode: React.FC<MultiplayerModeProps> = ({ rounds }) => {
     roomStateRef.current = roomState;
   }, [roomState]);
 
+  // Automatický reset označené odpovědi při přechodu na novou otázku, kolo nebo stav
+  useEffect(() => {
+    setLocalSelectedOption(null);
+  }, [
+    roomState?.currentRoundIndex,
+    roomState?.currentQuestionIndex,
+    roomState?.currentQuestion?.id,
+    roomState?.status
+  ]);
+
   // Synchronizace stavu předčítání
   useEffect(() => {
     const unsub = pubSpeech.subscribe((s) => {
@@ -68,6 +104,59 @@ export const MultiplayerMode: React.FC<MultiplayerModeProps> = ({ rounds }) => {
     });
     return () => unsub();
   }, []);
+
+  // Zpracování parametru z URL pro přímé připojení týmu přes QR kód
+  useEffect(() => {
+    if (initialJoinCode) {
+      setInputRoomCode(initialJoinCode.toUpperCase());
+      if (role === 'SELECT_ROLE') {
+        setRole('TEAM_VIEW');
+      }
+    }
+  }, [initialJoinCode, role]);
+
+  // Generování QR kódu s odkazem pro okamžité připojení mobilních týmů
+  useEffect(() => {
+    if (roomState?.code) {
+      const joinUrl = `${window.location.origin}/?join=${encodeURIComponent(roomState.code)}`;
+      QRCode.toDataURL(joinUrl, {
+        width: 380,
+        margin: 2,
+        color: {
+          dark: '#140c06',
+          light: '#fffef5',
+        },
+        errorCorrectionLevel: 'M',
+      })
+        .then((url) => {
+          setQrCodeDataUrl(url);
+        })
+        .catch((err) => {
+          console.error('Chyba při generování QR kódu:', err);
+        });
+    } else {
+      setQrCodeDataUrl(null);
+    }
+  }, [roomState?.code]);
+
+  const handleCopyLink = () => {
+    if (!roomState?.code) return;
+    const joinUrl = `${window.location.origin}/?join=${encodeURIComponent(roomState.code)}`;
+    navigator.clipboard.writeText(joinUrl).then(() => {
+      setHasCopiedLink(true);
+      pubAudio.playBeerClink();
+      setTimeout(() => setHasCopiedLink(false), 2500);
+    }).catch(() => {});
+  };
+
+  const handleCopyCode = () => {
+    if (!roomState?.code) return;
+    navigator.clipboard.writeText(roomState.code).then(() => {
+      setHasCopiedCode(true);
+      pubAudio.playBeerClink();
+      setTimeout(() => setHasCopiedCode(false), 2500);
+    }).catch(() => {});
+  };
 
   // Stabilní připojení WebSocketu pro celou herní seanci (neukončuje se při změně myTeamId)
   useEffect(() => {
@@ -118,6 +207,17 @@ export const MultiplayerMode: React.FC<MultiplayerModeProps> = ({ rounds }) => {
                 pubAudio.playBeerClink();
               }
               prevTeamsCountRef.current = room.teams.length;
+            }
+
+            // Pokud přichází nová otázka nebo se stav mění na QUESTION, vyčistit starou označenou odpověď
+            if (
+              room.status === 'QUESTION' &&
+              (room.currentQuestion?.id !== roomStateRef.current?.currentQuestion?.id ||
+               room.currentQuestionIndex !== roomStateRef.current?.currentQuestionIndex ||
+               room.currentRoundIndex !== roomStateRef.current?.currentRoundIndex ||
+               roomStateRef.current?.status !== 'QUESTION')
+            ) {
+              setLocalSelectedOption(null);
             }
 
             setRoomState(room);
@@ -226,7 +326,68 @@ export const MultiplayerMode: React.FC<MultiplayerModeProps> = ({ rounds }) => {
   const handleCreateRoom = () => {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     const freshRounds = generateRandomQuizRounds({ roundsCount: 5, questionsPerRound: 5, shuffleOptions: true });
-    ws.send(JSON.stringify({ type: 'CREATE_ROOM', rounds: freshRounds, forceRandom: true }));
+    ws.send(JSON.stringify({
+      type: 'CREATE_ROOM',
+      rounds: freshRounds,
+      forceRandom: true,
+      hostTeamName: hostInitialTeamName.trim() || 'Stůl 1 (Kvízmistr)',
+      hostMembers: hostInitialMembers.length > 0 ? hostInitialMembers : ['Kvízmistr'],
+    }));
+  };
+
+  // Otevření okna pro úpravu stolu / týmu
+  const handleOpenEditTeam = (team: MultiplayerTeam) => {
+    setEditingTeamId(team.id);
+    setEditTeamName(team.name);
+    setEditTeamMembers([...team.members]);
+    setNewEditMemberName('');
+    setEditErrorMessage(null);
+    setIsEditingTeamModalOpen(true);
+  };
+
+  // Uložení úpravy stolu / týmu (odeslání přes WebSocket)
+  const handleSaveTeamEdit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editTeamName.trim()) {
+      setEditErrorMessage('Zadejte název stolu / týmu.');
+      return;
+    }
+    if (editTeamMembers.length === 0) {
+      setEditErrorMessage('Přidejte alespoň 1 člena týmu (1 až 10).');
+      return;
+    }
+    const socket = wsRef.current || ws;
+    if (!socket || !roomState || !editingTeamId) return;
+
+    socket.send(JSON.stringify({
+      type: 'UPDATE_TEAM',
+      code: roomState.code,
+      teamId: editingTeamId,
+      name: editTeamName.trim(),
+      members: editTeamMembers,
+    }));
+
+    pubAudio.playBeerClink();
+    setIsEditingTeamModalOpen(false);
+  };
+
+  const handleAddEditMember = () => {
+    if (!newEditMemberName.trim()) return;
+    if (editTeamMembers.length >= 10) {
+      setEditErrorMessage('Maximální počet členů týmu je 10.');
+      return;
+    }
+    setEditTeamMembers([...editTeamMembers, newEditMemberName.trim()]);
+    setNewEditMemberName('');
+    setEditErrorMessage(null);
+  };
+
+  const handleRemoveEditMember = (idx: number) => {
+    if (editTeamMembers.length <= 1) {
+      setEditErrorMessage('Tým musí mít alespoň jednoho člena.');
+      return;
+    }
+    setEditTeamMembers(editTeamMembers.filter((_, i) => i !== idx));
   };
 
   // Vylosování jiné sady otázek pro aktuální místnost
@@ -322,25 +483,32 @@ export const MultiplayerMode: React.FC<MultiplayerModeProps> = ({ rounds }) => {
 
   // Ovládání Kvízmistra
   const handleStartGame = () => {
-    if (!ws || !roomState) return;
-    ws.send(JSON.stringify({ type: 'START_GAME', code: roomState.code }));
+    setLocalSelectedOption(null);
+    const socket = wsRef.current || ws;
+    if (!socket || !roomState) return;
+    socket.send(JSON.stringify({ type: 'START_GAME', code: roomState.code }));
     pubAudio.playTavernBell();
   };
 
   const handleNextQuestion = () => {
-    if (!ws || !roomState) return;
-    ws.send(JSON.stringify({ type: 'NEXT_QUESTION', code: roomState.code }));
+    setLocalSelectedOption(null);
+    const socket = wsRef.current || ws;
+    if (!socket || !roomState) return;
+    socket.send(JSON.stringify({ type: 'NEXT_QUESTION', code: roomState.code }));
   };
 
   const handleForceReveal = () => {
-    if (!ws || !roomState) return;
-    ws.send(JSON.stringify({ type: 'REVEAL_NOW', code: roomState.code }));
+    const socket = wsRef.current || ws;
+    if (!socket || !roomState) return;
+    socket.send(JSON.stringify({ type: 'REVEAL_NOW', code: roomState.code }));
     pubAudio.playTavernBell();
   };
 
   const handleRestartRoom = () => {
-    if (!ws || !roomState) return;
-    ws.send(JSON.stringify({ type: 'RESTART_ROOM', code: roomState.code }));
+    setLocalSelectedOption(null);
+    const socket = wsRef.current || ws;
+    if (!socket || !roomState) return;
+    socket.send(JSON.stringify({ type: 'RESTART_ROOM', code: roomState.code }));
     hasHonkedRef.current = false;
     setIsHonking(false);
   };
@@ -406,10 +574,92 @@ export const MultiplayerMode: React.FC<MultiplayerModeProps> = ({ rounds }) => {
               </p>
             </div>
 
+            {/* Možnost předem nastavit název stolu a členy Kvízmistra */}
+            <div className="space-y-3 pt-1">
+              <button
+                type="button"
+                onClick={() => setShowHostCustomization(!showHostCustomization)}
+                className="text-xs text-amber-400 hover:text-amber-300 flex items-center gap-1.5 underline cursor-pointer"
+              >
+                <Edit3 className="w-3.5 h-3.5" />
+                <span>{showHostCustomization ? 'Skrýt nastavení stolu' : 'Nastavit jméno a členy stolu Kvízmistra'}</span>
+              </button>
+
+              {showHostCustomization && (
+                <div className="space-y-3 p-3 bg-stone-900/90 border border-amber-900/70 rounded-xl text-left">
+                  <div>
+                    <label className="block text-[11px] font-semibold uppercase tracking-wider text-stone-300 mb-1">
+                      Název vašeho stolu
+                    </label>
+                    <input
+                      type="text"
+                      value={hostInitialTeamName}
+                      onChange={(e) => setHostInitialTeamName(e.target.value)}
+                      placeholder="Stůl 1 (Kvízmistr)"
+                      className="w-full px-3 py-1.5 bg-stone-950 border border-stone-700 rounded-lg text-xs text-amber-300 focus:outline-none focus:ring-1 focus:ring-amber-500 font-medium"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-[11px] font-semibold uppercase tracking-wider text-stone-300 mb-1">
+                      Členové u stolu ({hostInitialMembers.length})
+                    </label>
+                    <div className="flex gap-1.5 mb-2">
+                      <input
+                        type="text"
+                        value={newHostMemberName}
+                        onChange={(e) => setNewHostMemberName(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') {
+                            e.preventDefault();
+                            if (newHostMemberName.trim() && hostInitialMembers.length < 10) {
+                              setHostInitialMembers([...hostInitialMembers, newHostMemberName.trim()]);
+                              setNewHostMemberName('');
+                            }
+                          }
+                        }}
+                        placeholder="Jméno člena..."
+                        className="flex-1 px-2.5 py-1 bg-stone-950 border border-stone-700 rounded-lg text-xs text-stone-200 focus:outline-none focus:ring-1 focus:ring-amber-500"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (newHostMemberName.trim() && hostInitialMembers.length < 10) {
+                            setHostInitialMembers([...hostInitialMembers, newHostMemberName.trim()]);
+                            setNewHostMemberName('');
+                          }
+                        }}
+                        className="px-2.5 py-1 bg-amber-600 hover:bg-amber-500 text-stone-950 text-xs font-bold rounded-lg cursor-pointer"
+                      >
+                        +
+                      </button>
+                    </div>
+
+                    <div className="flex flex-wrap gap-1.5">
+                      {hostInitialMembers.map((m, i) => (
+                        <span key={i} className="inline-flex items-center gap-1 px-2 py-0.5 bg-stone-800 border border-stone-700 rounded text-[11px] text-stone-200">
+                          <span>{m}</span>
+                          {hostInitialMembers.length > 1 && (
+                            <button
+                              type="button"
+                              onClick={() => setHostInitialMembers(hostInitialMembers.filter((_, idx) => idx !== i))}
+                              className="text-stone-400 hover:text-red-400"
+                            >
+                              <X className="w-3 h-3" />
+                            </button>
+                          )}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+
             <button
               onClick={handleCreateRoom}
               disabled={!isConnected}
-              className="w-full py-4 bg-amber-500 hover:bg-amber-400 disabled:opacity-40 text-stone-950 font-serif font-bold text-base rounded-xl transition-all shadow-md flex items-center justify-center gap-2"
+              className="w-full py-4 bg-amber-500 hover:bg-amber-400 disabled:opacity-40 text-stone-950 font-serif font-bold text-base rounded-xl transition-all shadow-md flex items-center justify-center gap-2 cursor-pointer"
             >
               <Crown className="w-5 h-5" />
               <span>Vytvořit novou místnost</span>
@@ -475,6 +725,16 @@ export const MultiplayerMode: React.FC<MultiplayerModeProps> = ({ rounds }) => {
             </div>
           )}
 
+          {inputRoomCode && (
+            <div className="p-3 bg-amber-950/60 border border-amber-600/70 rounded-xl text-amber-200 text-xs flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <QrCode className="w-4 h-4 text-amber-400 shrink-0" />
+                <span>Kód místnosti: <strong className="font-mono text-amber-300 font-bold tracking-wider">{inputRoomCode}</strong></span>
+              </div>
+              <span className="text-[10px] bg-emerald-500/20 border border-emerald-500/40 text-emerald-300 px-2 py-0.5 rounded font-medium">Z QR kódu / pozvánky</span>
+            </div>
+          )}
+
           <form onSubmit={handleJoinTeam} className="space-y-4">
             <div>
               <label className="block text-xs font-semibold uppercase tracking-wider text-stone-300 mb-1">
@@ -498,6 +758,7 @@ export const MultiplayerMode: React.FC<MultiplayerModeProps> = ({ rounds }) => {
                 type="text"
                 placeholder="Např. Štamgasti od pípy"
                 value={inputTeamName}
+                autoFocus={Boolean(inputRoomCode)}
                 onChange={(e) => setInputTeamName(e.target.value)}
                 className="w-full px-4 py-3 bg-stone-900 border border-stone-700 rounded-xl text-stone-100 text-sm focus:outline-none focus:ring-2 focus:ring-amber-500 font-medium"
                 required
@@ -582,26 +843,134 @@ export const MultiplayerMode: React.FC<MultiplayerModeProps> = ({ rounds }) => {
   if (roomState.status === 'LOBBY') {
     return (
       <div className="max-w-4xl mx-auto px-4 py-8 space-y-8">
-        {/* Kód místnosti a stav */}
-        <div className="bg-[#18110b] border border-amber-900/70 rounded-3xl p-6 md:p-8 shadow-2xl text-center space-y-4">
-          <div className="inline-flex items-center gap-2 text-xs font-semibold uppercase tracking-widest text-amber-500">
-            <Radio className="w-4 h-4 animate-pulse text-emerald-400" />
-            <span>Kvízová místnost připravena</span>
+        {/* Kód místnosti a QR kód pro okamžité připojení mobilů */}
+        <div className="bg-[#18110b] border border-amber-900/70 rounded-3xl p-6 md:p-8 shadow-2xl space-y-6">
+          <div className="flex flex-col sm:flex-row items-center justify-between gap-3 pb-4 border-b border-amber-950/80">
+            <div className="inline-flex items-center gap-2 text-xs font-semibold uppercase tracking-widest text-amber-500">
+              <Radio className="w-4 h-4 animate-pulse text-emerald-400" />
+              <span>Hospodská kvízová místnost připravena</span>
+            </div>
+            <div className="text-xs text-stone-400 flex items-center gap-2">
+              <Smartphone className="w-4 h-4 text-amber-400" />
+              <span>Hráči se připojí naskenováním QR kódu</span>
+            </div>
           </div>
 
-          <h1 className="text-2xl md:text-3xl font-serif font-bold text-amber-100">
-            Kód pro připojení týmů:
-          </h1>
+          <div className="grid grid-cols-1 md:grid-cols-12 gap-6 items-center">
+            {/* Levá část: Kód místnosti, instrukce a rychlé akce */}
+            <div className="md:col-span-7 text-center md:text-left space-y-4">
+              <div>
+                <span className="text-xs font-semibold uppercase tracking-wider text-amber-400">
+                  Kód pro váš stůl a hospodu
+                </span>
+                <h1 className="text-2xl sm:text-3xl font-serif font-bold text-amber-100 mt-0.5">
+                  Připojte svůj tým do hry
+                </h1>
+              </div>
 
-          <div className="inline-block px-8 py-4 bg-stone-900 border-2 border-dashed border-amber-500 rounded-2xl">
-            <span className="text-4xl md:text-5xl font-mono font-bold text-amber-400 tracking-wider">
-              {roomState.code}
-            </span>
+              {/* Velký box kódu s tlačítky kopírování */}
+              <div className="flex flex-col sm:flex-row items-center gap-3">
+                <div className="px-6 py-3 bg-stone-900/90 border-2 border-dashed border-amber-500 rounded-2xl shadow-inner flex items-center justify-center">
+                  <span className="text-3xl sm:text-4xl font-mono font-black text-amber-400 tracking-widest select-all">
+                    {roomState.code}
+                  </span>
+                </div>
+
+                <div className="flex flex-wrap sm:flex-col gap-2 justify-center">
+                  <button
+                    type="button"
+                    onClick={handleCopyCode}
+                    className="px-3.5 py-2 bg-stone-900 hover:bg-stone-800 border border-stone-700 hover:border-amber-500 text-stone-200 text-xs font-medium rounded-xl transition-all flex items-center gap-1.5 cursor-pointer shadow-sm"
+                    title="Zkopírovat kód místnosti"
+                  >
+                    {hasCopiedCode ? (
+                      <>
+                        <Check className="w-3.5 h-3.5 text-emerald-400" />
+                        <span className="text-emerald-400 font-semibold">Kód zkopírován</span>
+                      </>
+                    ) : (
+                      <>
+                        <Copy className="w-3.5 h-3.5 text-amber-400" />
+                        <span>Kopírovat kód</span>
+                      </>
+                    )}
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={handleCopyLink}
+                    className="px-3.5 py-2 bg-stone-900 hover:bg-stone-800 border border-stone-700 hover:border-amber-500 text-stone-200 text-xs font-medium rounded-xl transition-all flex items-center gap-1.5 cursor-pointer shadow-sm"
+                    title="Zkopírovat přímý odkaz pro připojení"
+                  >
+                    {hasCopiedLink ? (
+                      <>
+                        <Check className="w-3.5 h-3.5 text-emerald-400" />
+                        <span className="text-emerald-400 font-semibold">Odkaz zkopírován</span>
+                      </>
+                    ) : (
+                      <>
+                        <ExternalLink className="w-3.5 h-3.5 text-amber-400" />
+                        <span>Kopírovat odkaz</span>
+                      </>
+                    )}
+                  </button>
+                </div>
+              </div>
+
+              {/* Rychlý návod */}
+              <div className="space-y-1.5 text-xs text-stone-300 bg-stone-900/50 p-3.5 rounded-xl border border-stone-800/80 text-left">
+                <div className="font-semibold text-amber-300 flex items-center gap-1.5">
+                  <QrCode className="w-3.5 h-3.5 text-amber-400" />
+                  <span>Jak se připojit z mobilního telefonu:</span>
+                </div>
+                <p className="text-stone-400 leading-relaxed">
+                  1. Otevřete fotoaparát na mobilu a namiřte na QR kód vpravo.
+                </p>
+                <p className="text-stone-400 leading-relaxed">
+                  2. Kód stolu se načte automaticky — zadejte jen název týmu a hrajete!
+                </p>
+              </div>
+            </div>
+
+            {/* Pravá část: Interaktivní QR kód */}
+            <div className="md:col-span-5 flex flex-col items-center justify-center">
+              <div className="relative group bg-[#fffef5] p-3 rounded-2xl shadow-2xl border-4 border-amber-900/70 transition-transform hover:scale-[1.02]">
+                {qrCodeDataUrl ? (
+                  <img
+                    src={qrCodeDataUrl}
+                    alt={`QR kód pro připojení k místnosti ${roomState.code}`}
+                    className="w-48 h-48 sm:w-52 sm:h-52 object-contain rounded-lg cursor-pointer"
+                    onClick={() => setIsQrModalOpen(true)}
+                    title="Kliknutím zvětšíte QR kód na celou obrazovku"
+                  />
+                ) : (
+                  <div className="w-48 h-48 sm:w-52 sm:h-52 flex flex-col items-center justify-center bg-stone-100 rounded-lg text-stone-500">
+                    <QrCode className="w-10 h-10 animate-pulse text-amber-600 mb-2" />
+                    <span className="text-xs font-mono">Generování QR...</span>
+                  </div>
+                )}
+
+                <button
+                  type="button"
+                  onClick={() => setIsQrModalOpen(true)}
+                  className="absolute bottom-2 right-2 bg-stone-950/90 hover:bg-stone-900 text-amber-300 px-2 py-1 rounded-lg border border-amber-500/60 shadow-md transition-all flex items-center gap-1 text-[11px] font-medium cursor-pointer"
+                  title="Zvětšit QR kód pro promítačku nebo celou hospodu"
+                >
+                  <Maximize2 className="w-3.5 h-3.5" />
+                  <span>Zvětšit</span>
+                </button>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => setIsQrModalOpen(true)}
+                className="mt-2.5 text-xs text-amber-400 hover:text-amber-300 flex items-center gap-1.5 font-medium underline underline-offset-4 cursor-pointer"
+              >
+                <QrCode className="w-3.5 h-3.5" />
+                <span>Zvětšit QR kód na celou obrazovku</span>
+              </button>
+            </div>
           </div>
-
-          <p className="text-xs text-stone-400 max-w-md mx-auto">
-            Hráči otevřou tuto aplikaci na svém zařízení, zvolí „Připojit se jako tým“ a zadají tento kód.
-          </p>
 
           {/* Přehled připojených týmů (2 až 10) */}
           <div className="pt-6 border-t border-amber-950">
@@ -637,6 +1006,43 @@ export const MultiplayerMode: React.FC<MultiplayerModeProps> = ({ rounds }) => {
               </div>
             </div>
 
+            {/* Zvýrazněná karta stolu Kvízmistra s možností okamžité úpravy názvu a členů */}
+            {role === 'HOST_VIEW' && roomState.teams.some((t) => t.tableNumber === 1 || t.id === myTeamId) && (
+              (() => {
+                const hostTeam = roomState.teams.find((t) => t.id === myTeamId) || roomState.teams.find((t) => t.tableNumber === 1)!;
+                return (
+                  <div className="mb-4 p-4 bg-gradient-to-r from-amber-950/80 via-stone-900 to-amber-950/60 border border-amber-600/70 rounded-2xl flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 shadow-lg">
+                    <div className="flex items-center gap-3">
+                      <div className="w-10 h-10 rounded-xl bg-amber-500/20 border border-amber-500/50 flex items-center justify-center text-amber-400 shrink-0">
+                        <Crown className="w-5 h-5" />
+                      </div>
+                      <div>
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <span className="font-serif font-bold text-base text-amber-100">{hostTeam.name}</span>
+                          <span className="text-[10px] bg-amber-500 text-stone-950 font-bold px-2 py-0.5 rounded">
+                            Stůl #1 · Kvízmistr
+                          </span>
+                        </div>
+                        <div className="text-xs text-stone-300 mt-0.5">
+                          Členové týmu ({hostTeam.members.length}): <span className="text-amber-200/90 font-medium">{hostTeam.members.join(', ')}</span>
+                        </div>
+                      </div>
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={() => handleOpenEditTeam(hostTeam)}
+                      className="px-3.5 py-2 bg-amber-500 hover:bg-amber-400 text-stone-950 text-xs font-serif font-bold rounded-xl flex items-center gap-2 transition-all cursor-pointer shadow-md shrink-0"
+                      title="Změnit název vašeho stolu a přidat další členy týmu"
+                    >
+                      <Edit3 className="w-4 h-4" />
+                      <span>Upravit stůl Kvízmistra</span>
+                    </button>
+                  </div>
+                );
+              })()
+            )}
+
             {roomState.teams.length === 0 ? (
               <div className="py-8 text-stone-500 italic text-sm">
                 Zatím se nepřipojil žádný tým. Čeká se na příchod prvních štamgastů...
@@ -647,7 +1053,7 @@ export const MultiplayerMode: React.FC<MultiplayerModeProps> = ({ rounds }) => {
                   <div
                     key={team.id}
                     className={`p-4 rounded-xl border text-left transition-all ${
-                      team.id === myTeamId
+                      team.id === myTeamId || (role === 'HOST_VIEW' && team.tableNumber === 1)
                         ? 'bg-amber-950/60 border-amber-500 ring-2 ring-amber-500/50'
                         : 'bg-stone-900/70 border-stone-800'
                     }`}
@@ -663,11 +1069,33 @@ export const MultiplayerMode: React.FC<MultiplayerModeProps> = ({ rounds }) => {
                     <div className="text-xs text-stone-400 truncate">
                       Členové ({team.members.length}): {team.members.join(', ')}
                     </div>
-                    {team.id === myTeamId && (
-                      <span className="inline-block mt-2 text-[10px] bg-amber-600 text-stone-950 font-bold px-2 py-0.5 rounded">
-                        Vaše zařízení
-                      </span>
-                    )}
+                    <div className="flex items-center justify-between mt-3 pt-2 border-t border-amber-950/80">
+                      <div className="flex items-center gap-1.5 flex-wrap">
+                        {team.id === myTeamId && (
+                          <span className="text-[10px] bg-amber-600 text-stone-950 font-bold px-2 py-0.5 rounded">
+                            Vaše zařízení
+                          </span>
+                        )}
+                        {team.tableNumber === 1 && (
+                          <span className="text-[10px] bg-amber-950 text-amber-300 border border-amber-700/60 font-semibold px-2 py-0.5 rounded flex items-center gap-1">
+                            <Crown className="w-3 h-3 text-amber-400" />
+                            <span>Kvízmistr</span>
+                          </span>
+                        )}
+                      </div>
+
+                      {(team.id === myTeamId || role === 'HOST_VIEW') && (
+                        <button
+                          type="button"
+                          onClick={() => handleOpenEditTeam(team)}
+                          className="text-xs text-amber-300 hover:text-amber-100 bg-stone-800/90 hover:bg-stone-700 border border-amber-700/50 hover:border-amber-500 px-2.5 py-1 rounded-lg transition-colors flex items-center gap-1.5 font-medium cursor-pointer"
+                          title="Upravit název stolu a členy týmu"
+                        >
+                          <Edit3 className="w-3.5 h-3.5 text-amber-400" />
+                          <span>Upravit stůl</span>
+                        </button>
+                      )}
+                    </div>
                   </div>
                 ))}
               </div>
@@ -711,6 +1139,209 @@ export const MultiplayerMode: React.FC<MultiplayerModeProps> = ({ rounds }) => {
             )}
           </div>
         </div>
+
+        {/* Modální okno pro velké zobrazení QR kódu pro celou hospodu / promítačku */}
+        {isQrModalOpen && (
+          <div
+            className="fixed inset-0 z-50 bg-black/90 backdrop-blur-md flex items-center justify-center p-4"
+            onClick={() => setIsQrModalOpen(false)}
+          >
+            <div
+              className="bg-[#18110b] border-2 border-amber-600 rounded-3xl p-6 sm:p-8 max-w-lg w-full text-center space-y-6 shadow-2xl relative"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <button
+                type="button"
+                onClick={() => setIsQrModalOpen(false)}
+                className="absolute top-4 right-4 p-2 text-stone-400 hover:text-stone-100 bg-stone-900 rounded-full border border-stone-700 cursor-pointer"
+                title="Zavřít"
+              >
+                <X className="w-5 h-5" />
+              </button>
+
+              <div className="space-y-1">
+                <span className="text-xs font-semibold uppercase tracking-widest text-amber-400 flex items-center justify-center gap-2">
+                  <QrCode className="w-4 h-4 text-amber-400" />
+                  <span>Naskenujte telefonem a hrajte</span>
+                </span>
+                <h2 className="text-2xl sm:text-3xl font-serif font-bold text-amber-100">
+                  Připojení k hospodskému kvízu
+                </h2>
+                <p className="text-xs text-stone-300">
+                  Namiřte fotoaparát na kód pro okamžité vytvoření vašeho týmu
+                </p>
+              </div>
+
+              <div className="bg-[#fffef5] p-4 sm:p-6 rounded-2xl mx-auto inline-block shadow-2xl border-4 border-amber-700/60">
+                {qrCodeDataUrl ? (
+                  <img
+                    src={qrCodeDataUrl}
+                    alt={`QR kód ${roomState.code}`}
+                    className="w-64 h-64 sm:w-80 sm:h-80 object-contain mx-auto"
+                  />
+                ) : null}
+              </div>
+
+              <div className="space-y-3">
+                <div className="inline-block px-6 py-2.5 bg-stone-900 border border-amber-500/80 rounded-xl">
+                  <span className="text-xs text-stone-400 mr-2 uppercase tracking-wider">Kód místnosti:</span>
+                  <span className="text-2xl sm:text-3xl font-mono font-bold text-amber-400 tracking-wider">
+                    {roomState.code}
+                  </span>
+                </div>
+
+                <div className="flex justify-center gap-3">
+                  <button
+                    type="button"
+                    onClick={handleCopyLink}
+                    className="px-4 py-2.5 bg-amber-500 hover:bg-amber-400 text-stone-950 font-serif font-bold text-xs rounded-xl flex items-center gap-1.5 transition-colors cursor-pointer shadow-md"
+                  >
+                    {hasCopiedLink ? <Check className="w-4 h-4" /> : <ExternalLink className="w-4 h-4" />}
+                    <span>{hasCopiedLink ? 'Odkaz zkopírován!' : 'Zkopírovat odkaz'}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setIsQrModalOpen(false)}
+                    className="px-4 py-2.5 bg-stone-800 hover:bg-stone-700 text-stone-200 text-xs rounded-xl transition-colors cursor-pointer"
+                  >
+                    Zavřít
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Modální okno pro úpravu stolu / týmu (název a členové) */}
+        {isEditingTeamModalOpen && (
+          <div
+            className="fixed inset-0 z-50 bg-black/85 backdrop-blur-sm flex items-center justify-center p-4"
+            onClick={() => setIsEditingTeamModalOpen(false)}
+          >
+            <div
+              className="bg-[#18110b] border-2 border-amber-600 rounded-3xl p-6 sm:p-8 max-w-lg w-full text-left space-y-6 shadow-2xl relative"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="flex items-center justify-between pb-3 border-b border-amber-950">
+                <div className="flex items-center gap-2.5">
+                  <div className="w-9 h-9 rounded-xl bg-amber-500/20 border border-amber-500/50 flex items-center justify-center text-amber-400">
+                    <Edit3 className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <h3 className="text-xl font-serif font-bold text-amber-100">
+                      Upravit stůl v kvízu
+                    </h3>
+                    <span className="text-xs text-amber-400">
+                      Změna názvu a členů se ihned projeví všem stolům
+                    </span>
+                  </div>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={() => setIsEditingTeamModalOpen(false)}
+                  className="p-1.5 text-stone-400 hover:text-stone-100 rounded-lg bg-stone-900 border border-stone-800 cursor-pointer"
+                  title="Zavřít"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              {editErrorMessage && (
+                <div className="p-3 bg-red-950/80 border border-red-500 text-red-200 rounded-xl text-xs flex items-center gap-2">
+                  <AlertTriangle className="w-4 h-4 shrink-0" />
+                  <span>{editErrorMessage}</span>
+                </div>
+              )}
+
+              <form onSubmit={handleSaveTeamEdit} className="space-y-5">
+                <div>
+                  <label className="block text-xs font-semibold uppercase tracking-wider text-stone-300 mb-1.5">
+                    Název stolu / týmu
+                  </label>
+                  <input
+                    type="text"
+                    value={editTeamName}
+                    onChange={(e) => setEditTeamName(e.target.value)}
+                    placeholder="Např. Štamgasti od výčepu"
+                    className="w-full px-4 py-3 bg-stone-900 border border-stone-700 rounded-xl text-amber-200 font-serif font-bold text-lg focus:outline-none focus:ring-2 focus:ring-amber-500"
+                    required
+                    autoFocus
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-xs font-semibold uppercase tracking-wider text-stone-300 mb-1.5">
+                    Členové u stolu ({editTeamMembers.length} z 10)
+                  </label>
+
+                  <div className="flex gap-2 mb-3">
+                    <input
+                      type="text"
+                      placeholder="Jméno člena (např. Petr, Lucka)..."
+                      value={newEditMemberName}
+                      onChange={(e) => setNewEditMemberName(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') {
+                          e.preventDefault();
+                          handleAddEditMember();
+                        }
+                      }}
+                      className="flex-1 px-3 py-2 bg-stone-900 border border-stone-700 rounded-lg text-stone-100 text-sm focus:outline-none focus:ring-2 focus:ring-amber-500"
+                    />
+                    <button
+                      type="button"
+                      onClick={handleAddEditMember}
+                      className="px-4 py-2 bg-amber-600 hover:bg-amber-500 text-stone-950 rounded-lg text-xs font-bold flex items-center gap-1 shrink-0 cursor-pointer"
+                    >
+                      <UserPlus className="w-4 h-4" />
+                      <span>Přidat</span>
+                    </button>
+                  </div>
+
+                  {/* Seznam členů týmu */}
+                  <div className="flex flex-wrap gap-2 max-h-36 overflow-y-auto p-2 bg-stone-950/60 rounded-xl border border-stone-800">
+                    {editTeamMembers.map((member, i) => (
+                      <span
+                        key={i}
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-stone-900 border border-amber-900/60 rounded-lg text-xs text-stone-200 shadow-sm"
+                      >
+                        <span className="font-medium">{member}</span>
+                        {editTeamMembers.length > 1 && (
+                          <button
+                            type="button"
+                            onClick={() => handleRemoveEditMember(i)}
+                            className="text-stone-400 hover:text-red-400 transition-colors cursor-pointer"
+                            title="Odebrat člena"
+                          >
+                            <X className="w-3.5 h-3.5" />
+                          </button>
+                        )}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="flex justify-end gap-3 pt-3 border-t border-amber-950">
+                  <button
+                    type="button"
+                    onClick={() => setIsEditingTeamModalOpen(false)}
+                    className="px-4 py-2.5 bg-stone-900 hover:bg-stone-800 border border-stone-700 text-stone-300 text-xs font-semibold rounded-xl transition-colors cursor-pointer"
+                  >
+                    Zrušit
+                  </button>
+                  <button
+                    type="submit"
+                    className="px-6 py-2.5 bg-amber-500 hover:bg-amber-400 text-stone-950 font-serif font-bold text-sm rounded-xl transition-all shadow-md flex items-center gap-2 cursor-pointer"
+                  >
+                    <Check className="w-4 h-4" />
+                    <span>Uložit změny stolu</span>
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        )}
       </div>
     );
   }
@@ -737,9 +1368,15 @@ export const MultiplayerMode: React.FC<MultiplayerModeProps> = ({ rounds }) => {
     const q = roomState.currentQuestion;
     if (!q) return null;
 
-    const activeSelectedIdx = localSelectedOption !== null ? localSelectedOption : (myTeam?.selectedOption ?? null);
-    const hasMyTeamAnswered = myTeam?.hasAnswered ?? false;
     const isReveal = roomState.status === 'REVEAL';
+    const hasMyTeamAnswered = myTeam?.hasAnswered ?? false;
+    // Během nové otázky (QUESTION), pokud tým ještě neodpověděl a nemá nově označenou možnost, je výběr vždy null
+    const activeSelectedIdx =
+      !isReveal && !hasMyTeamAnswered && localSelectedOption === null
+        ? null
+        : localSelectedOption !== null
+        ? localSelectedOption
+        : (myTeam?.selectedOption ?? null);
 
     const answeredCount = roomState.teams.filter((t) => t.hasAnswered && t.selectedOption !== null).length;
     const totalTeams = roomState.teams.length;

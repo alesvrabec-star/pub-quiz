@@ -513,12 +513,19 @@ async function startServer() {
               fastestCorrectTeam: null,
             };
 
-            // Vytvoříme také výchozí stůl pro hostitele (Stůl 1), aby mohl moderátor hrát a odpovídat přímo ze svého zařízení
+            // Vytvoříme stůl pro hostitele (Stůl 1), který může moderátor ihned upravit (jméno i členy)
             const hostTeamId = `team-host-${Date.now()}`;
+            const hostTeamName = typeof msg.hostTeamName === 'string' && msg.hostTeamName.trim()
+              ? msg.hostTeamName.trim()
+              : 'Stůl 1 (Kvízmistr)';
+            const hostMembers = Array.isArray(msg.hostMembers) && msg.hostMembers.length > 0
+              ? msg.hostMembers.map((m: any) => String(m).trim()).filter(Boolean)
+              : ['Kvízmistr'];
+
             const hostTeam: TeamSession = {
               id: hostTeamId,
-              name: msg.hostTeamName?.trim() || 'Stůl 1 (Kvízmistr)',
-              members: ['Kvízmistr'],
+              name: hostTeamName,
+              members: hostMembers,
               tableNumber: 1,
               score: 0,
               selectedOption: null,
@@ -800,6 +807,29 @@ async function startServer() {
             // Kvízmistr si může přímo v lobby vylosovat novou sadu otázek
             room.rounds = generateRandomQuizRounds({ roundsCount: 5, questionsPerRound: 5, shuffleOptions: true });
             broadcastRoomState(room);
+            break;
+          }
+
+          case 'UPDATE_TEAM': {
+            const code = attachedRoomCode || (msg.code || '').toUpperCase();
+            const room = rooms.get(code);
+            if (!room) return;
+            const teamId = msg.teamId;
+            const team = room.teams.get(teamId);
+            if (team) {
+              if (typeof msg.name === 'string' && msg.name.trim()) {
+                team.name = msg.name.trim();
+              }
+              if (Array.isArray(msg.members) && msg.members.length > 0) {
+                const cleaned = msg.members
+                  .map((m: any) => String(m).trim())
+                  .filter((m: string) => m.length > 0);
+                if (cleaned.length > 0) {
+                  team.members = cleaned.slice(0, 10);
+                }
+              }
+              broadcastRoomState(room);
+            }
             break;
           }
         }

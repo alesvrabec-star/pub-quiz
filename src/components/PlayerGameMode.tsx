@@ -47,6 +47,11 @@ export const PlayerGameMode: React.FC<PlayerGameModeProps> = ({ rounds }) => {
     return () => unsub();
   }, []);
 
+  // Vždy vyčistit označenou odpověď při přechodu na jinou otázku nebo kolo
+  useEffect(() => {
+    setSelectedOption(null);
+  }, [currentRoundIdx, currentQuestionIdx]);
+
   // Automatické předčítání otázky při přechodu do fáze QUESTION
   useEffect(() => {
     if (stage === 'QUESTION' && currentQuestion) {
